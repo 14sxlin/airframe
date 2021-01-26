@@ -12,23 +12,22 @@
  * limitations under the License.
  */
 package wvlet.airframe.http.grpc
-import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder
+
 import io.grpc._
 import wvlet.airframe.codec.MessageCodecFactory
-import wvlet.airframe.control.MultipleExceptions
 import wvlet.airframe.http.Router
+import wvlet.airframe.http.grpc.internal.{GrpcRequestLogger, GrpcServiceBuilder}
 import wvlet.airframe.{Design, Session}
 import wvlet.log.LogSupport
 import wvlet.log.io.IOUtil
 
 import java.util.concurrent.{ExecutorService, Executors}
-import scala.collection.parallel.immutable.ParVector
 import scala.language.existentials
-import scala.util.control.NonFatal
 
 /**
   */
 case class GrpcServerConfig(
+    // The server name
     name: String = "default",
     private val serverPort: Option[Int] = None,
     router: Router = Router.empty,
@@ -37,7 +36,11 @@ case class GrpcServerConfig(
     executorProvider: GrpcServerConfig => ExecutorService = { config: GrpcServerConfig =>
       Executors.newCachedThreadPool()
     },
-    codecFactory: MessageCodecFactory = MessageCodecFactory.defaultFactoryForMapOutput
+    codecFactory: MessageCodecFactory = MessageCodecFactory.defaultFactoryForMapOutput,
+    requestLoggerProvider: GrpcServerConfig => GrpcRequestLogger = { config: GrpcServerConfig =>
+      GrpcRequestLogger
+        .newLogger(config.name)
+    }
 ) extends LogSupport {
   lazy val port = serverPort.getOrElse(IOUtil.unusedPort)
 
@@ -47,6 +50,7 @@ case class GrpcServerConfig(
 
   /**
     * Use this method to customize gRPC server, e.g., setting tracer, add transport filter, etc.
+    *
     * @param serverInitializer
     * @return
     */
@@ -55,6 +59,7 @@ case class GrpcServerConfig(
 
   /**
     * Add an gRPC interceptor
+    *
     * @param interceptor
     * @return
     */
@@ -69,6 +74,11 @@ case class GrpcServerConfig(
     this.copy(executorProvider = provider)
 
   def withCodecFactory(newCodecFactory: MessageCodecFactory) = this.copy(codecFactory = newCodecFactory)
+
+  def withRequestLoggerProvider(provider: GrpcServerConfig => GrpcRequestLogger) = this
+    .copy(requestLoggerProvider = provider)
+  // Disable RPC logging
+  def noRequestLogging = this.copy(requestLoggerProvider = { config: GrpcServerConfig => GrpcRequestLogger.nullLogger })
 
   /**
     * Create and start a new server based on this config.
@@ -85,7 +95,7 @@ case class GrpcServerConfig(
     * If you want to keep running the server inside the code block, call server.awaitTermination.
     */
   def start[U](body: GrpcServer => U): U = {
-    design.run[GrpcServer, U] { server =>
+    design.noLifeCycleLogging.run[GrpcServer, U] { server =>
       body(server)
     }
   }
@@ -101,6 +111,7 @@ case class GrpcServerConfig(
 
   /**
     * Create a design for GrpcServer and ManagedChannel. Useful for testing purpose
+    *
     * @return
     */
   def designWithChannel: Design = {
@@ -115,42 +126,12 @@ case class GrpcServerConfig(
   }
 }
 
-/**
-  * GrpcService is a holder of the thread executor and service definitions for running gRPC servers
-  */
-case class GrpcService(
-    config: GrpcServerConfig,
-    executorService: ExecutorService,
-    serviceDefinitions: Seq[ServerServiceDefinition]
-) extends AutoCloseable
-    with LogSupport {
-  def newServer: GrpcServer = {
-    trace(s"service:\n${serviceDefinitions.map(_.getServiceDescriptor).mkString("\n")}")
-    // We need to use NettyServerBuilder explicitly when NettyServerBuilder cannot be found from the classpath (e.g., onejar)
-    val serverBuilder = NettyServerBuilder.forPort(config.port)
-    for (service <- serviceDefinitions) {
-      serverBuilder.addService(service)
-    }
-    for (interceptor <- config.interceptors) {
-      serverBuilder.intercept(interceptor)
-    }
-    val customServerBuilder = config.serverInitializer(serverBuilder)
-    val server              = new GrpcServer(this, customServerBuilder.build())
-    server.start
-    server
-  }
-
-  override def close(): Unit = {
-    executorService.shutdownNow()
-  }
-}
-
 class GrpcServer(grpcService: GrpcService, server: Server) extends AutoCloseable with LogSupport {
   def port: Int            = grpcService.config.port
   def localAddress: String = s"localhost:${port}"
 
   def start: Unit = {
-    info(s"Starting gRPC server: (${grpcService.config.name}) at ${localAddress}")
+    info(s"Starting gRPC server [${grpcService.config.name}] at ${localAddress}")
     server.start()
   }
 
@@ -159,56 +140,8 @@ class GrpcServer(grpcService: GrpcService, server: Server) extends AutoCloseable
   }
 
   override def close(): Unit = {
-    info(s"Closing gRPC server (${grpcService.config.name}) at ${localAddress}")
+    info(s"Closing gRPC server [${grpcService.config.name}] at ${localAddress}")
     server.shutdownNow()
     grpcService.close()
   }
-}
-
-/**
-  * GrpcServerFactory manages
-  * @param session
-  */
-class GrpcServerFactory(session: Session) extends AutoCloseable with LogSupport {
-  private var createdServers = List.empty[GrpcServer]
-
-  def newServer(config: GrpcServerConfig): GrpcServer = {
-    val server = config.newServer(session)
-    synchronized {
-      createdServers = server :: createdServers
-    }
-    server
-  }
-
-  def awaitTermination: Unit = {
-    // Workaround for `.par` in Scala 2.13, which requires import scala.collection.parallel.CollectionConverters._
-    // But this import doesn't work in Scala 2.12
-    val b = ParVector.newBuilder[GrpcServer]
-    b ++= createdServers
-    b.result().foreach(_.awaitTermination)
-  }
-
-  override def close(): Unit = {
-    debug(s"Closing GrpcServerFactory")
-    val ex = Seq.newBuilder[Throwable]
-    for (server <- createdServers) {
-      try {
-        server.close()
-      } catch {
-        case NonFatal(e) =>
-          ex += e
-      }
-    }
-    createdServers = List.empty
-
-    val exceptions = ex.result()
-    if (exceptions.nonEmpty) {
-      if (exceptions.size == 1) {
-        throw exceptions.head
-      } else {
-        throw MultipleExceptions(exceptions)
-      }
-    }
-  }
-
 }

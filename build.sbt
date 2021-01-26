@@ -206,7 +206,7 @@ lazy val jsProjects: Seq[ProjectReference] = Seq(
   rxJS,
   httpJS,
   rxHtmlJS,
-  widgetJS,
+  widget,
   airspecJS
 )
 
@@ -606,7 +606,7 @@ lazy val jdbc =
       libraryDependencies ++= Seq(
         "org.xerial"     % "sqlite-jdbc" % SQLITE_JDBC_VERSION,
         "org.postgresql" % "postgresql"  % "42.2.18",
-        "com.zaxxer"     % "HikariCP"    % "3.4.5",
+        "com.zaxxer"     % "HikariCP"    % "4.0.1",
         // For routing slf4j log to airframe-log
         "org.slf4j" % "slf4j-jdk14" % SLF4J_VERSION
       )
@@ -638,11 +638,14 @@ lazy val rxJS  = rx.js
 lazy val http =
   crossProject(JVMPlatform, JSPlatform)
     .crossType(CrossType.Pure)
+    .enablePlugins(BuildInfoPlugin)
     .in(file("airframe-http"))
     .settings(buildSettings)
     .settings(
       name := "airframe-http",
-      description := "REST API Framework"
+      description := "REST and RPC Framework",
+      buildInfoKeys := Seq[BuildInfoKey](name, version, scalaVersion, sbtVersion),
+      buildInfoPackage := "wvlet.airframe.http"
     )
     .jvmSettings(
       libraryDependencies ++= {
@@ -875,23 +878,19 @@ lazy val rxHtmlJVM = rxHtml.jvm
 lazy val rxHtmlJS  = rxHtml.js
 
 lazy val widget =
-  crossProject(JSPlatform)
-    .crossType(CrossType.Pure)
+  project
+    .enablePlugins(ScalaJSPlugin)
     .in(file("airframe-rx-widget"))
     //    .enablePlugins(ScalaJSBundlerPlugin)
     .settings(buildSettings)
     .settings(
-      name := "airframe-rx-widget",
-      description := "Reactive Widget library for Scala.js"
-    )
-    .jsSettings(
       jsBuildSettings,
+      name := "airframe-rx-widget",
+      description := "Reactive Widget library for Scala.js",
       jsEnv in Test := new org.scalajs.jsenv.jsdomnodejs.JSDOMNodeJSEnv()
       //      npmDependencies in Test += "node" -> "12.14.1"
     )
-    .dependsOn(log, rxHtml)
-
-lazy val widgetJS = widget.js
+    .dependsOn(logJS, rxHtmlJS)
 
 lazy val examples =
   project
@@ -930,7 +929,7 @@ lazy val sbtAirframe =
       // This setting might be unnecessary?
       //crossSbtVersions := Vector("1.3.13"),
       libraryDependencies ++= Seq(
-        "io.get-coursier"   %% "coursier"         % "2.0.8",
+        "io.get-coursier"   %% "coursier"         % "2.0.9",
         "org.apache.commons" % "commons-compress" % "1.20"
       ),
       scriptedLaunchOpts := {
